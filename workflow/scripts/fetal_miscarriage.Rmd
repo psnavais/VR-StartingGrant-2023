@@ -1,0 +1,258 @@
+---
+title: "Fetal effects on miscarriage - Preliminary results from MoBa"
+author: "Pol Sole Navais"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+library(dplyr)
+library(ggplot2)
+library(data.table)
+library(cowplot)
+library(knitr)
+library(kableExtra)
+library(tidyr)
+library(broom)
+library(fitdistrplus)
+
+colorBlindBlack8= c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+knitr::opts_chunk$set(fig.width=7, fig.height=4)
+
+```
+
+# Rationale
+
+Human reproduction is highly inefficient; pregnancy loss is estimated to affect almost 70% of all conceptions and is the most common pregnancy outcome. Aneuploidies are one of the major causes of miscarriage, particularly early in pregnancy. Aneuploidies likely disrupt multiple pathways, making it difficult to improve our knowledge on the biological mechanisms behind miscarriage. It is increasingly evident that, cumulatively, small genetic effects scattered across the genome have a profound impact on human traits, even on those previously considered as monogenic (e.g. eye color). Only one GWAS of miscarriage has been performed to date, and used the maternal genome. Performing a fetal GWAS of miscarriage may clarify to what extent the fetal genome contributes to miscarriage beyond aneuploidies, provide meaningful biology behind miscarriage and, potentially, improve reproductive health.
+
+# Phenotype
+
+```{r read-pheno}
+pheno= fread(snakemake@input[[1]])
+```
+
+We haven't excluded any individual, besides those not passing the QC of genotype data. The number of miscarriages was calculated as the sum of miscarriages < 13 gestational weeks and those between 13-22. In total, there are `r nrow(pheno)` samples.  
+
+```{r plot miscarriage distribution, include=FALSE}
+ggplot(pheno, aes(miscarriage)) +
+  geom_histogram() +
+  theme_cowplot()
+
+
+table(pheno$miscarriage)
+
+```
+
+
+## Distribution that best fits the data
+
+
+Normal distribution:  
+
+```{r normal dist, echo=FALSE}
+fit.nb= fitdist(pheno$miscarriage, distr= 'nbinom')
+fit.norm= fitdist(pheno$miscarriage, distr= 'norm')
+fit.pois= fitdist(pheno$miscarriage, distr= 'pois')
+
+plot(fit.norm)
+
+```
+
+Poisson distribution:  
+
+```{r poisson dist, echo=FALSE}
+plot(fit.pois)
+
+```
+
+One assumption of poisson distributions is that mean and variance should be equal:
+
+```{r poisson assumptions, echo=FALSE}
+print(paste('Mean:', round(mean(pheno$miscarriage), 3)))
+print(paste('Variance:', round(var(pheno$miscarriage), 3)))
+
+```
+
+Negative binomial:  
+
+```{r negative binomial, echo=FALSE}
+plot(fit.nb)
+```
+
+# GWAS
+
+We have conducted a GWAS of the number of miscarriages using non-related fetal samples (using LMMs in GWAS by proxy is not straightforward). We must note that the effective sample size is `r print(nrow(pheno) / 4)` (obtained by dividing the observed sample size by the square of the correction factor, 2 for first-degree relatives).
+
+
+```{r load GWAS results, echo=FALSE}
+
+gwas= fread(snakemake@input[[2]], select= c('CHROM', 'GENPOS', 'ALLELE1', 'ALLELE0', 'BETA', 'SE', 'LOG10P', 'A1FREQ', 'N', 'INFO'))
+
+gwas= filter(gwas, A1FREQ>= 0.01, A1FREQ< 0.99)
+```
+
+We only included SNPs with MAF >= 1% and an INFO score > 0.6 (a total of `r nrow(gwas)`).
+
+```{r manhattan, echo=FALSE}
+
+desat <- function(cols, sat=0.5) {
+  X <- diag(c(1, sat, 1)) %*% rgb2hsv(col2rgb(cols))
+  hsv(X[1,], X[2,], X[3,])
+}
+
+desat_colorBlindBlack8= desat(colorBlindBlack8, 0.5)
+
+
+don= gwas %>%
+  group_by(CHROM)      %>%
+  summarise(chr_len= max(GENPOS)) %>%
+  mutate(tot= cumsum(as.numeric(chr_len)) - chr_len) %>% # Calculate cumulative position of each chromosome
+  #select(-chr_len) %>%
+  left_join(gwas, ., by= 'CHROM') %>%
+  arrange(CHROM, GENPOS) %>% # Add a cumulative position of each SNP
+  mutate(BPcum=GENPOS+tot) %>%
+  ungroup()
+
+axisdf = don %>% group_by(CHROM) %>% summarize(center=( max(BPcum) + min(BPcum)) / 2 )
+names(axisdf)= c('CHROM', 'center')
+
+HC= -log10(5*10**-8)
+
+don$CHR2= with(don, ifelse(CHROM %% 2 == T, 'odd', 'even'))
+
+ggplot(data= don, aes(x= BPcum, y= LOG10P, colour= CHR2)) +
+  geom_hline(yintercept= 0, linewidth= 0.25, colour= 'black') +
+  geom_point(size= 0.07) + # Show all points
+  theme_cowplot(font_size= 9) +
+  scale_colour_manual(values= c(desat_colorBlindBlack8[6], colorBlindBlack8[6]), guide= F) +
+  scale_x_continuous(label = c(1:19, '', 21,'', 'X'), breaks= axisdf$center, expand= expansion(0)) +
+  scale_y_continuous(breaks= seq(0, round(max(don$LOG10P)) + 1, 5), labels= seq(0, round(max(don$LOG10P)) + 1, 5),
+                     expand= expansion(add= c(0, 1))) +
+  ylab(expression(-log[10]~pvalue)) +
+  xlab('Chromosome') +
+  geom_hline(yintercept= HC, linewidth= 0.2, linetype= 2, colour= '#878787') +
+  coord_cartesian(clip = "off") 
+
+```
+
+
+# QQ-plot
+
+```{r QQ, echo=FALSE}
+gwas= arrange(gwas, desc(LOG10P))
+
+df= mutate(gwas, exp1= -log10(1:length(LOG10P)/length(LOG10P)))
+
+chisq= qchisq(1-10**-df$LOG10P, 1)
+
+lambda_gc= median(chisq)/qchisq(0.5, 1)
+
+ggplot(filter(df, LOG10P>3), aes(exp1, LOG10P)) +
+  geom_point(size= 0.4, color= colorBlindBlack8[2]) +
+  geom_abline(intercept = 0, slope = 1, alpha = .5) +
+labs(colour="") +
+theme_cowplot(font_size= 10) +
+xlab(expression(Expected~-log[10]~pvalue)) +
+ylab(expression(Observed~-log[10]~pvalue)) +
+geom_text(aes(6, 0), label= paste("lambda", "==", round(lambda_gc, 2)), size= 10/.pt, parse= T)
+
+```
+
+
+# Hardy-Weinberg equilibrium
+
+```{r HWE, echo=FALSE}
+
+#Read SNP data for top variants
+
+x= fread(snakemake@input[[3]])
+
+x$SNP= gsub('_X_', '_23_', x$SNP)
+  x$SNP= gsub('X_', '', x$SNP)
+  
+  x= separate(x, SNP, into= c('CHROM', 'GENPOS', 'ALLELE0', 'ALLELE1'), sep= '_')
+  x$CHROM= as.numeric(x$CHROM)
+  x$GENPOS= as.numeric(x$GENPOS)
+  
+  x[x$ALLELE1< x$ALLELE0, c('ALLELE0', 'ALLELE1')]= x[(x$ALLELE1< x$ALLELE0), c('ALLELE1', 'ALLELE0')]
+  
+  # Flip beta, eaf and alleles to alphabetically higher
+  gwas= filter(gwas, GENPOS %in% x$GENPOS)
+  gwas$BETA= ifelse(gwas$ALLELE1< gwas$ALLELE0, gwas$BETA * -1, gwas$BETA)
+  gwas$A1FREQ= ifelse(gwas$ALLELE1< gwas$ALLELE0, 1 - gwas$A1FREQ, gwas$A1FREQ)
+  
+  gwas[gwas$ALLELE1< gwas$ALLELE0, c('ALLELE0', 'ALLELE1')]= gwas[(gwas$ALLELE1< gwas$ALLELE0), c('ALLELE1', 'ALLELE0')]
+  gwas= inner_join(gwas, x, by= c('CHROM', 'GENPOS', 'ALLELE0', 'ALLELE1'))
+  
+  ggplot(gwas, aes(LOG10P, -log10(hwe_pvalue))) +
+      geom_point() + 
+  geom_abline(intercept= 0, slope= 1, colour= 'black') + 
+  geom_hline(yintercept= 0) + 
+  geom_vline(xintercept= 0) +
+  xlab('Linear model, -log10(p)') +
+  ylab('HWE, -log10(p)') +
+  theme_bw()
+  
+  ggplot(gwas, aes(BETA, -log10(hwe_pvalue))) +
+      geom_point() + 
+  geom_abline(intercept= 0, slope= 1, colour= 'black') + 
+  geom_hline(yintercept= 0) + 
+  geom_vline(xintercept= 0) +
+  xlab('BETA, # miscarriages') +
+  ylab('HWE, -log10(p)') +
+  theme_bw()
+```
+
+
+```{r MAF, echo=FALSE}
+
+gwas= filter(gwas, LOG10P>5)
+
+```
+
+
+# Plot of fetal miscarriage variants for target power of 80% - MAF vs Beta
+
+
+```{r power, echo=FALSE}
+#Let's plot the known SZ variants on frequency - effect size coordinates
+#And draw some power curves there at genome-wide significance threshold
+gwas= filter(gwas, A1FREQ>=0.01, A1FREQ< 0.99)
+maf = ifelse(gwas$A1FREQ> 0.5, 1-gwas$A1FREQ, gwas$A1FREQ)
+beta = abs(gwas$BETA) #effect size on log-odds-ratio scale with positive sign
+pw.thresh = 0.8
+p.threshold = 5e-8
+
+q = qchisq(p.threshold, df = 1, lower = F) #chi-square value corresp. significance threshold
+#matrix of numbers of cases (col1) and controls (col2):
+Ns = matrix( c(nrow(pheno), 65000, 300000), ncol = 1 , byrow = T) 
+cols=c("green", "cyan", "blue")
+
+f = seq(0.01, 0.5, length = 1000)
+b = seq(0, 0.3, length = 1000)
+
+
+df_list= lapply(1:nrow(Ns), function(set){
+  pw = rep(NA, length(b)) #power at each candidate b
+  b.for.f = rep(NA,length(f)) #for each f gives the b value that leads to target power
+  for(i in 1:length(f)){ 
+    pw = pchisq(q, df = 1, ncp = 2*f[i]*(1-f[i])*Ns[set,]*b^2/var(pheno$miscarriage), lower = F)
+    b.for.f[i] = b[ min( which(pw > pw.thresh) ) ]
+  }
+  return(data.frame(maf= f, beta = b.for.f, n= rep(Ns[set,], length(f))))
+  legends = c(legends, paste(Ns[set,],collapse = "/") ) #make a "#cases/#controls" tag for legend
+}
+)
+
+df= do.call('rbind', df_list)
+ggplot() +
+  geom_point(aes(maf, beta)) +
+  geom_line(data= df, aes(maf, beta, colour= factor(n))) +
+  theme_bw()
+  
+```
+
